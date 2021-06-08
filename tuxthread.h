@@ -91,7 +91,6 @@ static int munmap(void *addr, size_t len) {
   return result;
 }
 
-
 static pid_t waitpid(pid_t pid, int *status, int options){
         size_t result;
         __asm__ volatile(
@@ -123,6 +122,13 @@ typedef struct{
     pid_t pid;
     char * stack;
 }thrd_t;
+
+void thrd_yield() {
+  asm volatile("syscall"
+               :
+               : "a"(24)
+               : "rcx", "r11", "memory");
+}
 
 int thrd_create(thrd_t *thr, int (*func)(void *), void *arg) {
   unsigned flags = SIGCHLD | CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
