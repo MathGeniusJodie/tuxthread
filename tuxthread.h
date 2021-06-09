@@ -198,12 +198,13 @@ int mtx_init(mtx_t *mutex, int type) {
 int mtx_lock(mtx_t *mutex) {
 	int c = cmpxchg(mutex, UNLOCKED, LOCKED);
 	if (c == UNLOCKED) return 0;
-	if (c == LOCKED) xchg(mutex, CONTENDED);
-	while (c){
-		//wait until not CONTENDED
-		futex(mutex, FUTEX_WAIT, CONTENDED, 0, 0, 0);
-		c = xchg(mutex, CONTENDED);
-	}
+
+	cmpxchg(mutex, LOCKED, CONTENDED);
+    while (c){ // protect against spurious wakeups
+        // wait until not CONTENDED
+        futex(mutex, FUTEX_WAIT, CONTENDED, 0, 0, 0);
+        c = xchg(mutex, CONTENDED);
+    }
     return 0;
 }
 
