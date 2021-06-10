@@ -1,4 +1,4 @@
-//usr/bin/gcc -O2 mutex.c -o mutex -static; exec ./mutex
+//usr/bin/gcc -O2 mutex.c -o mutex -static -pedantic; exec ./mutex
 
 #include <unistd.h>
 #include <string.h>

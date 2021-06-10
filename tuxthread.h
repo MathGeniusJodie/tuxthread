@@ -72,7 +72,8 @@ __attribute__((naked)) int clone(int (*fn)(void *), void *restrict stack,
           "retq   \n");
 }
 
-static void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
+static void *mmap(void *addr, size_t len, int prot, int flags, int fd,
+                  off_t off) {
   register int r10 asm("r10") = flags;
   register int r8 asm("r8") = fd;
   register off_t r9 asm("r9") = off;
@@ -95,15 +96,13 @@ static int munmap(void *addr, size_t len) {
   return result;
 }
 
-static pid_t waitpid(pid_t pid, int *status, int options){
-        size_t result;
-        __asm__ volatile(
-                "syscall" :
-                "=a"(result) :
-                "0"(61), "D"(pid), "S"(status), "d"(options) :
-                "rcx", "r11", "memory"
-        );
-        return result;
+static pid_t waitpid(pid_t pid, int *status, int options) {
+  size_t result;
+  __asm__ volatile("syscall"
+                   : "=a"(result)
+                   : "0"(61), "D"(pid), "S"(status), "d"(options)
+                   : "rcx", "r11", "memory");
+  return result;
 }
 /*
 pid_t fork(){
@@ -112,7 +111,7 @@ pid_t fork(){
   register long r9 asm("r9") = 0;
 
   long flags = CLONE_CHILD_CLEARTID |CLONE_CHILD_CLEARTID | SIGCHLD;
-	
+
   pid_t result;
   asm volatile("syscall"
                : "=a"(result)
@@ -122,45 +121,41 @@ pid_t fork(){
   return result;
 }
 */
-typedef struct{
-    pid_t pid;
-    char * stack;
-}thrd_t;
+typedef struct {
+  pid_t pid;
+  char *stack;
+} thrd_t;
 
 void thrd_yield() {
-  asm volatile("syscall"
-               :
-               : "a"(24)
-               : "rcx", "r11", "memory");
+  asm volatile("syscall" : : "a"(24) : "rcx", "r11", "memory");
 }
 
 int thrd_create(thrd_t *thr, int (*func)(void *), void *arg) {
   unsigned flags = SIGCHLD | CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
-                   CLONE_SYSVSEM | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID ;
+                   CLONE_SYSVSEM | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
 
   char *stack = mmap(0, TUXTHREAD_STACK_SIZE, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
-  thr->pid = clone(func, stack + TUXTHREAD_STACK_SIZE -1, flags, arg);
+  thr->pid = clone(func, stack + TUXTHREAD_STACK_SIZE - 1, flags, arg);
   thr->stack = stack;
   return 0;
 }
 
 int thrd_join(thrd_t thr, int *result) {
   waitpid(thr.pid, result, 0);
-  munmap(thr.stack,TUXTHREAD_STACK_SIZE);
+  munmap(thr.stack, TUXTHREAD_STACK_SIZE);
   *result = WEXITSTATUS(*result);
   return 0;
 }
 
+#define FUTEX_WAIT 0
+#define FUTEX_WAKE 1
 
-
-#define FUTEX_WAIT		0
-#define FUTEX_WAKE		1
-
-static int futex(volatile void *addr1, int op, int val1, void *timeout, void *addr2, int val3) {
-  register void * r10 asm("r10") = timeout;
-  register void * r8 asm("r8") = addr2;
+static int futex(volatile void *addr1, int op, int val1, void *timeout,
+                 void *addr2, int val3) {
+  register void *r10 asm("r10") = timeout;
+  register void *r8 asm("r8") = addr2;
   register int r9 asm("r9") = val3;
 
   int result;
@@ -171,49 +166,46 @@ static int futex(volatile void *addr1, int op, int val1, void *timeout, void *ad
                : "rcx", "r11", "memory");
   return result;
 }
-
+/*
 // from linux source code
 static inline unsigned int xchg(volatile unsigned int *ptr, unsigned int x) {
-	asm volatile("xchgl %0,%1"
+        asm volatile("xchgl %0,%1"
                 : "=r" (x), "+m" (*ptr)
                 : "0" (x)
                 : "memory");
     return x;
-}
-
+}*/
+#define xchg(a, b) __atomic_exchange_n(a, b, __ATOMIC_SEQ_CST)
 #define cmpxchg(P, O, N) __sync_val_compare_and_swap((P), (O), (N))
 
-typedef volatile unsigned int mtx_t;
+typedef volatile _Atomic(unsigned int) mtx_t;
 
-
-#define UNLOCKED 0
-#define LOCKED 1
-#define CONTENDED 2
+enum mtx_state { UNLOCKED, LOCKED, CONTENDED };
 
 int mtx_init(mtx_t *mutex, int type) {
-    *mutex = UNLOCKED;
-    return 0;
+  *mutex = UNLOCKED;
+  return 0;
 }
 
 int mtx_lock(mtx_t *mutex) {
-	int c = cmpxchg(mutex, UNLOCKED, LOCKED);
-	if (c == UNLOCKED) return 0;
-
-	cmpxchg(mutex, LOCKED, CONTENDED);
-    while (c){ // protect against spurious wakeups
-        // wait until not CONTENDED
-        futex(mutex, FUTEX_WAIT, CONTENDED, 0, 0, 0);
-        c = xchg(mutex, CONTENDED);
-    }
+  int c = cmpxchg(mutex, UNLOCKED, LOCKED);
+  if (c == UNLOCKED)
     return 0;
+
+  cmpxchg(mutex, LOCKED, CONTENDED);
+  while (c) { // protect against spurious wakeups
+    // wait until not CONTENDED
+    futex(mutex, FUTEX_WAIT, CONTENDED, 0, 0, 0);
+    c = xchg(mutex, CONTENDED);
+  }
+  return 0;
 }
 
 int mtx_unlock(mtx_t *mutex) {
-    int c = xchg(mutex, UNLOCKED);
-    if (c == CONTENDED){
-    	// wake up one  waiter
-        futex(mutex, FUTEX_WAKE, 1, 0, 0, 0);
-    }
-    return 0;
+  int c = xchg(mutex, UNLOCKED);
+  if (c == CONTENDED) {
+    // wake up one waiter
+    futex(mutex, FUTEX_WAKE, 1, 0, 0, 0);
+  }
+  return 0;
 }
-
