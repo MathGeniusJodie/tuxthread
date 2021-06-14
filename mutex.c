@@ -3,12 +3,12 @@
 #include <unistd.h>
 #include <string.h>
 #include "tuxthread.h"
+#include <stdlib.h>
 
 mtx_t printf_mutex;
 
 
 int thread_func(void *thread_arg) {
-
   mtx_lock(&printf_mutex);
   write(1,"1\n",2);
   sleep(1);

@@ -1,6 +1,146 @@
+#define TUXTHREAD_STACK_SIZE (1024 * 1024 * 4)
+
 typedef int pid_t;
 typedef long off_t;
 typedef unsigned long size_t;
+
+// syscall rdi rsi rdx r10 r8 r9
+// func    rdi rsi rdx rcx r8 r9
+
+// rbx,rsp,rbp,r12,r13,r14,r15 need to be preserved
+
+//#define _GNU_SOURCE
+//#include <sched.h>
+
+// https://man7.org/linux/man-pages/man2/clone.2.html
+
+// syscall rdi rsi rdx r10 r8 r9
+// func    rdi rsi rdx rcx r8 r9
+
+__asm__(".text\n"
+        "tt_clone:\n"
+        // push onto child_stack
+        "subq $16, %rsi\n"
+        "movq %rcx, 8(%rsi)\n" // args
+        "movq %rdi, 0(%rsi)\n" // fn
+
+        "mov $0x38,%rax\n"   // clone syscall number
+        "mov %rdx,%rdi\n"    // flags
+                             // (%rsi) stack
+        "mov %r8,%rdx\n"     // parent tid
+        "mov 8(%rsp),%r10\n" // child tid
+        "mov %r9,%r8\n"      // tls
+        "syscall\n"
+
+        "test %rax,%rax\n" // rax is the return of the syscall
+        "jne  clone_skip_end\n"
+        "xorq %rbp, %rbp\n" // gaston recommended this
+        "popq %rax\n"
+        "popq %rdi\n"
+        "call *%rax\n"
+
+        "mov %rax,%rdi\n"  // use return of func as input of exit
+        "mov $0x3c,%rax\n" // exit syscall number
+        "syscall\n"
+        "clone_skip_end:\n"
+        "ret");
+
+int tt_clone(int (*fn)(void *), void *restrict stack, int flags,
+             void *restrict arg, int *parent_tid, void *new_tls,
+             int *child_tid);
+
+#if defined(__GNUC__) || defined(__clang__)
+/*
+static int tt_clone(int (*fn)(void *), void *child_stack, int flags, void *arg,
+                  int *parent_tid, void *new_tls, int *child_tid) {
+  int res;
+  __asm__ volatile(
+      // push onto child_stack
+      "subq   $16, %2\n"
+      "movq   %5, 8(%2)\n" // args
+      "movq   %4, 0(%2)\n" // fn
+
+      "movq   $56, %%rax\n"
+      "movq   %6, %%r8\n"  // new_tls
+      "movq   %7, %%r10\n" // child_tid
+      "syscall\n"
+      // if (rax != 0) return
+      "testq  %%rax, %%rax\n"
+      "jnz    1f\n"
+      // in child now
+      "xorq   %%rbp, %%rbp\n" // for debug
+      // call fn(arg)
+      "popq   %%rax\n"
+      "popq   %%rdi\n"
+      "call   *%%rax\n"
+      // call exit
+      "movq   %%rax, %%rdi\n"
+      "movq   $60, %%rax\n"
+      "syscall\n"
+      // return to parent
+      "1:\n"
+      : "=a"(res)
+      : "D"((long)flags), // 1 rdi
+        "S"(child_stack), // 2 rsi
+        "d"(parent_tid),  // 3 rdx
+        "r"(fn),          // 4
+        "r"(arg),         // 5
+        "r"(new_tls),     // 6
+        "r"(child_tid)    // 7
+      : "memory", "r8", "r10", "r11", "rcx");
+  return res;
+}*/
+
+static void *tt_mmap(void *addr, size_t len, int prot, int flags, int fd,
+                     off_t off) {
+  register int r10 __asm__("r10") = flags;
+  register int r8 __asm__("r8") = fd;
+  register off_t r9 __asm__("r9") = off;
+
+  void *result;
+  __asm__ volatile("syscall"
+                   : "=a"(result)
+                   : "0"(9), "D"(addr), "S"(len), "d"(prot), "r"(r10), "r"(r8),
+                     "r"(r9)
+                   : "rcx", "r11", "memory");
+  return result;
+}
+
+static int tt_futex(volatile void *addr1, int op, int val1, void *timeout,
+                    void *addr2, int val3) {
+  register void *r10 __asm__("r10") = timeout;
+  register void *r8 __asm__("r8") = addr2;
+  register int r9 __asm__("r9") = val3;
+
+  int result;
+  __asm__ volatile("syscall"
+                   : "=a"(result)
+                   : "0"(202), "D"(addr1), "S"(op), "d"(val1), "r"(r10),
+                     "r"(r8), "r"(r9)
+                   : "rcx", "r11", "memory");
+  return result;
+}
+#else
+
+__asm__(".text\n"
+        "tt_mmap:\n"
+        "	mov $9,%rax\n"
+        "	mov %rcx,%r10\n"
+        "	syscall\n"
+        "	ret\n");
+
+void *tt_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off);
+
+__asm__(".text\n"
+        "tt_futex:\n"
+        "	mov $202,%rax\n"
+        "	mov %rcx,%r10\n"
+        "	syscall\n"
+        "	ret\n");
+
+int tt_futex(volatile void *addr1, int op, int val1, void *timeout, void *addr2,
+             int val3);
+#endif
 
 #define mtx_plain 0
 #define SIGCHLD 17
@@ -36,72 +176,39 @@ typedef unsigned long size_t;
 #define PROT_WRITE 0x2
 #define PROT_EXEC 0x4
 
-#define TUXTHREAD_STACK_SIZE 1024 * 1024 * 4
+#define WNOHANG 1
+#define WUNTRACED 2
+
+#define WSTOPPED 2
+#define WEXITED 4
+#define WCONTINUED 8
+#define WNOWAIT 0x1000000
 
 #define WEXITSTATUS(s) (((s)&0xff00) >> 8)
+#define WTERMSIG(s) ((s)&0x7f)
+#define WSTOPSIG(s) WEXITSTATUS(s)
+#define WCOREDUMP(s) ((s)&0x80)
+#define WIFEXITED(s) (!WTERMSIG(s))
+#define WIFSTOPPED(s) ((short)((((s)&0xffff) * 0x10001) >> 8) > 0x7f00)
+#define WIFSIGNALED(s) (((s)&0xffff) - 1U < 0xffu)
+#define WIFCONTINUED(s) ((s) == 0xffff)
 
-// syscall rdi rsi rdx r10 r8 r9
-// func    rdi rsi rdx rcx r8 r9
-
-//#define _GNU_SOURCE
-//#include <sched.h>
-
-__attribute__((naked)) int clone(int (*fn)(void *), void *restrict stack,
-                                 int flags, void *restrict arg) {
-  __asm__("mov    %rdi,%r9\n"  // move func pointer for later use
-          "mov    %rcx,%r12\n" // move arg pointer for later
-
-          "mov    $0x38,%eax\n" // clone syscall
-          "mov    %rdx,%rdi\n"  // pass flags to syscall
-                                // %rsi is stack
-          "mov 	$0,%rdx\n"
-          "mov 	$0,%r10\n"
-          "mov 	$0,%r8\n"
-          "syscall \n"
-
-          "test   %eax,%eax\n" // test return of syscall
-          "jne    .foo\n"      // skip to end
-          "mov    %r12,%rdi\n" // getting args back to call func
-          "callq  *%r9\n"      // call func
-
-          // exit with return value of func
-          "mov    %rax,%rdi\n"
-          "mov    $0x3c,%rax\n"
-          "syscall \n"
-          ".foo:"
-          "retq   \n");
-}
-
-static void *mmap(void *addr, size_t len, int prot, int flags, int fd,
-                  off_t off) {
-  register int r10 asm("r10") = flags;
-  register int r8 asm("r8") = fd;
-  register off_t r9 asm("r9") = off;
-
-  void *result;
-  asm volatile("syscall"
-               : "=a"(result)
-               : "0"(9), "D"(addr), "S"(len), "d"(prot), "r"(r10), "r"(r8),
-                 "r"(r9)
-               : "rcx", "r11", "memory");
-  return result;
-}
-
-static int munmap(void *addr, size_t len) {
+static int tt_munmap(void *addr, size_t len) {
   int result;
-  asm volatile("syscall"
-               : "=a"(result)
-               : "0"(9), "D"(addr), "S"(len)
-               : "rcx", "r11", "memory");
-  return result;
-}
-
-static pid_t waitpid(pid_t pid, int *status, int options) {
-  size_t result;
   __asm__ volatile("syscall"
                    : "=a"(result)
-                   : "0"(61), "D"(pid), "S"(status), "d"(options)
+                   : "0"(9), "D"(addr), "S"(len)
                    : "rcx", "r11", "memory");
+  return result;
+}
+
+static pid_t tt_waitpid(pid_t pid, int *status, int options) {
+  size_t result;
+  __asm__ volatile("xor %%r10,%%r10\n"
+                   "syscall"
+                   : "=a"(result)
+                   : "0"(61), "D"(pid), "S"(status), "d"(options)
+                   : "rcx", "r11", "r10", "memory");
   return result;
 }
 /*
@@ -113,7 +220,7 @@ pid_t fork(){
   long flags = CLONE_CHILD_CLEARTID |CLONE_CHILD_CLEARTID | SIGCHLD;
 
   pid_t result;
-  asm volatile("syscall"
+  __asm__ volatile("syscall"
                : "=a"(result)
                : "0"(0x38), "D"(flags), "S"(0), "d"(0), "r"(r10), "r"(r8),
                  "r"(r9)
@@ -122,29 +229,31 @@ pid_t fork(){
 }
 */
 typedef struct {
-  pid_t pid;
   char *stack;
+  pid_t pid;
 } thrd_t;
 
 void thrd_yield() {
-  asm volatile("syscall" : : "a"(24) : "rcx", "r11", "memory");
+  __asm__ volatile("syscall" : : "a"(24) : "rcx", "r11", "memory");
 }
 
 int thrd_create(thrd_t *thr, int (*func)(void *), void *arg) {
   unsigned flags = SIGCHLD | CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
-                   CLONE_SYSVSEM | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
+                   CLONE_SYSVSEM; // |CLONE_PARENT_SETTID |
+                                  // CLONE_CHILD_SETTID;
 
-  char *stack = mmap(0, TUXTHREAD_STACK_SIZE, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  char *stack = tt_mmap(0, TUXTHREAD_STACK_SIZE, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
-  thr->pid = clone(func, stack + TUXTHREAD_STACK_SIZE - 1, flags, arg);
+  thr->pid = tt_clone(func, stack + TUXTHREAD_STACK_SIZE - 1, flags, arg,
+                      0, 0, 0);
   thr->stack = stack;
   return 0;
 }
 
 int thrd_join(thrd_t thr, int *result) {
-  waitpid(thr.pid, result, 0);
-  munmap(thr.stack, TUXTHREAD_STACK_SIZE);
+  tt_waitpid(thr.pid, result, 0);
+  tt_munmap(thr.stack, TUXTHREAD_STACK_SIZE);
   *result = WEXITSTATUS(*result);
   return 0;
 }
@@ -152,33 +261,26 @@ int thrd_join(thrd_t thr, int *result) {
 #define FUTEX_WAIT 0
 #define FUTEX_WAKE 1
 
-static int futex(volatile void *addr1, int op, int val1, void *timeout,
-                 void *addr2, int val3) {
-  register void *r10 asm("r10") = timeout;
-  register void *r8 asm("r8") = addr2;
-  register int r9 asm("r9") = val3;
-
-  int result;
-  asm volatile("syscall"
-               : "=a"(result)
-               : "0"(202), "D"(addr1), "S"(op), "d"(val1), "r"(r10), "r"(r8),
-                 "r"(r9)
-               : "rcx", "r11", "memory");
-  return result;
-}
-/*
 // from linux source code
 static inline unsigned int xchg(volatile unsigned int *ptr, unsigned int x) {
-        asm volatile("xchgl %0,%1"
-                : "=r" (x), "+m" (*ptr)
-                : "0" (x)
-                : "memory");
-    return x;
-}*/
-#define xchg(a, b) __atomic_exchange_n(a, b, __ATOMIC_SEQ_CST)
-#define cmpxchg(P, O, N) __sync_val_compare_and_swap((P), (O), (N))
+  __asm__ volatile("xchgl %0,%1" : "=r"(x), "+m"(*ptr) : "0"(x) : "memory");
+  return x;
+}
 
-typedef volatile _Atomic(unsigned int) mtx_t;
+static inline unsigned int cmpxchg(volatile unsigned int *ptr, unsigned int old,
+                                   unsigned int new) {
+  int ret;
+  __asm__ volatile("lock cmpxchgl %2,%1"
+                   : "=a"(ret), "+m"(*ptr)
+                   : "r"(new), "0"(old)
+                   : "memory");
+  return ret;
+}
+//#define xchg(a, b) __atomic_exchange_n(a, b, __ATOMIC_SEQ_CST)
+//#define cmpxchg(P, O, N) __sync_val_compare_and_swap((P), (O), (N))
+
+// typedef volatile _Atomic(unsigned int) mtx_t;
+typedef volatile unsigned int mtx_t;
 
 enum mtx_state { UNLOCKED, LOCKED, CONTENDED };
 
@@ -195,7 +297,7 @@ int mtx_lock(mtx_t *mutex) {
   cmpxchg(mutex, LOCKED, CONTENDED);
   while (c) { // protect against spurious wakeups
     // wait until not CONTENDED
-    futex(mutex, FUTEX_WAIT, CONTENDED, 0, 0, 0);
+    tt_futex(mutex, FUTEX_WAIT, CONTENDED, 0, 0, 0);
     c = xchg(mutex, CONTENDED);
   }
   return 0;
@@ -205,7 +307,7 @@ int mtx_unlock(mtx_t *mutex) {
   int c = xchg(mutex, UNLOCKED);
   if (c == CONTENDED) {
     // wake up one waiter
-    futex(mutex, FUTEX_WAKE, 1, 0, 0, 0);
+    tt_futex(mutex, FUTEX_WAKE, 1, 0, 0, 0);
   }
   return 0;
 }
