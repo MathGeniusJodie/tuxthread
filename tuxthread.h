@@ -1,4 +1,4 @@
-#define TUXTHREAD_STACK_SIZE (1024 * 1024 * 4)
+#define TUXTHREAD_STACK_SIZE (1024 * 128)
 
 typedef int pid_t;
 typedef long off_t;
@@ -11,58 +11,25 @@ typedef unsigned long size_t;
 
 //#define _GNU_SOURCE
 //#include <sched.h>
-
+//#define tt_clone clone
 // https://man7.org/linux/man-pages/man2/clone.2.html
 
 // syscall rdi rsi rdx r10 r8 r9
 // func    rdi rsi rdx rcx r8 r9
 
-__asm__(".text\n"
-        "tt_clone:\n"
-        // push onto child_stack
-        "subq $16, %rsi\n"
-        "movq %rcx, 8(%rsi)\n" // args
-        "movq %rdi, 0(%rsi)\n" // fn
-
-        "mov $0x38,%rax\n"   // clone syscall number
-        "mov %rdx,%rdi\n"    // flags
-                             // (%rsi) stack
-        "mov %r8,%rdx\n"     // parent tid
-        "mov 8(%rsp),%r10\n" // child tid
-        "mov %r9,%r8\n"      // tls
-        "syscall\n"
-
-        "test %rax,%rax\n" // rax is the return of the syscall
-        "jne  clone_skip_end\n"
-        "xorq %rbp, %rbp\n" // gaston recommended this
-        "popq %rax\n"
-        "popq %rdi\n"
-        "call *%rax\n"
-
-        "mov %rax,%rdi\n"  // use return of func as input of exit
-        "mov $0x3c,%rax\n" // exit syscall number
-        "syscall\n"
-        "clone_skip_end:\n"
-        "ret");
-
-int tt_clone(int (*fn)(void *), void *restrict stack, int flags,
-             void *restrict arg, int *parent_tid, void *new_tls,
-             int *child_tid);
-
-#if defined(__GNUC__) || defined(__clang__)
-/*
-static int tt_clone(int (*fn)(void *), void *child_stack, int flags, void *arg,
-                  int *parent_tid, void *new_tls, int *child_tid) {
+static int tt_clone(int (*fn)(void *), void *child_stack, int flags, void *arg){
+          //int *parent_tid, void *new_tls, int *child_tid) {
   int res;
   __asm__ volatile(
+	  "and    $-16,%2\n" // align to 16 bits
       // push onto child_stack
       "subq   $16, %2\n"
-      "movq   %5, 8(%2)\n" // args
-      "movq   %4, 0(%2)\n" // fn
+      "movq   %4, 8(%2)\n" // args
+      "movq   %3, 0(%2)\n" // fn
 
       "movq   $56, %%rax\n"
-      "movq   %6, %%r8\n"  // new_tls
-      "movq   %7, %%r10\n" // child_tid
+      //"movq   %6, %%r8\n"  // new_tls
+      //"movq   %7, %%r10\n" // child_tid
       "syscall\n"
       // if (rax != 0) return
       "testq  %%rax, %%rax\n"
@@ -82,14 +49,17 @@ static int tt_clone(int (*fn)(void *), void *child_stack, int flags, void *arg,
       : "=a"(res)
       : "D"((long)flags), // 1 rdi
         "S"(child_stack), // 2 rsi
-        "d"(parent_tid),  // 3 rdx
-        "r"(fn),          // 4
-        "r"(arg),         // 5
-        "r"(new_tls),     // 6
-        "r"(child_tid)    // 7
-      : "memory", "r8", "r10", "r11", "rcx");
+        "r"(fn),          // 3
+        "r"(arg)//,       // 4
+        //"d"(parent_tid),  // 5 rdx
+        //"r"(new_tls),     // 6
+       // "r"(child_tid)    // 7
+      : "memory",// "r8", "r10",
+      "r11", "rcx");
   return res;
-}*/
+}
+
+#if defined(__GNUC__) || defined(__clang__)
 
 static void *tt_mmap(void *addr, size_t len, int prot, int flags, int fd,
                      off_t off) {
@@ -239,14 +209,13 @@ void thrd_yield() {
 
 int thrd_create(thrd_t *thr, int (*func)(void *), void *arg) {
   unsigned flags = SIGCHLD | CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
-                   CLONE_SYSVSEM; // |CLONE_PARENT_SETTID |
-                                  // CLONE_CHILD_SETTID;
+                   CLONE_SYSVSEM;
 
   char *stack = tt_mmap(0, TUXTHREAD_STACK_SIZE, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
-  thr->pid = tt_clone(func, stack + TUXTHREAD_STACK_SIZE - 1, flags, arg,
-                      0, 0, 0);
+  thr->pid = tt_clone(func, stack + TUXTHREAD_STACK_SIZE - 1, flags, arg);
+                      //0, 0, 0);
   thr->stack = stack;
   return 0;
 }
@@ -276,6 +245,14 @@ static inline unsigned int cmpxchg(volatile unsigned int *ptr, unsigned int old,
                    : "memory");
   return ret;
 }
+
+static inline unsigned int xadd(volatile unsigned int *ptr, unsigned int x) {
+  __asm__ volatile ("lock xaddl %0, %1\n"
+  				    : "+r" (x), "+m" (*ptr)
+  				    : : "memory", "cc");	
+  return x;
+}
+
 //#define xchg(a, b) __atomic_exchange_n(a, b, __ATOMIC_SEQ_CST)
 //#define cmpxchg(P, O, N) __sync_val_compare_and_swap((P), (O), (N))
 
@@ -311,3 +288,37 @@ int mtx_unlock(mtx_t *mutex) {
   }
   return 0;
 }
+/*
+typedef struct {
+    mtx_t *m;
+    unsigned int seq;
+} cnd_t;
+
+int cnd_init(cnd_t *cond) {
+    cond->m = 0;
+    cond->seq = 0;
+    return 0;
+}
+
+int cnd_signal(cnd_t *cond) {
+    xadd(&cond->seq, 1);
+    tt_futex(&cond->seq, FUTEX_WAKE, 1, 0, 0, 0);
+    return 0;
+}
+
+int cnd_wait(cnd_t *cond, mtx_t *mutex) {
+    int seq = cond->seq;
+    if (cond->m != mutex) {
+        if (cond->m)
+            return -1;
+        cmpxchg(&cond->m, 0, mutex);
+        if (cond->m != mutex)
+            return -1;
+    }
+    mtx_unlock(mutex);
+    tt_futex(&cond->seq, FUTEX_WAIT, seq, 0, 0, 0);
+    while (xchg(mutex, CONTENDED))
+        tt_futex(mutex, FUTEX_WAIT, CONTENDED, 0, 0, 0);
+    return 0;
+}
+*/
